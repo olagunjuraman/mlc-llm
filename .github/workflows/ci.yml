@@ -1,0 +1,406 @@
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths-ignore:
+      - "*.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".gitignore"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "*.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".gitignore"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  PYTHON_VERSION: "3.13"
+  RUST_TOOLCHAIN: "1.82.0"
+
+
+
+jobs:
+
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint Dockerfile (hadolint)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: docker/Dockerfile
+          failure-threshold: warning
+
+      - name: Lint GitHub Actions workflow (actionlint)
+        uses: reviewdog/action-actionlint@v1
+
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Run infrastructure tests
+        run: |
+          pip install --quiet pytest
+          pytest tests/test_infra.py -v
+
+  docker:
+    name: Docker
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.image-ref.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute reusable image tag
+        id: buildenv-tag
+        run: |
+          echo "tag=buildenv-${{ hashFiles('docker/Dockerfile', 'docker/build-entrypoint.sh', 'docker/config.cmake') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Reuse prebuilt CI image (if available)
+        id: reuse-buildenv
+        if: github.event_name != 'pull_request'
+        run: |
+          BUILDENV_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.buildenv-tag.outputs.tag }}"
+          if docker pull "$BUILDENV_IMAGE"; then
+            echo "Reusing $BUILDENV_IMAGE"
+            docker tag "$BUILDENV_IMAGE" mlc-llm:ci-test
+            echo "reused=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No reusable build image found, building from source"
+            echo "reused=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and load image
+        if: github.event_name == 'pull_request' || steps.reuse-buildenv.outputs.reused != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          load: true
+          tags: mlc-llm:ci-test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Validate image
+        run: |
+          docker run --rm mlc-llm:ci-test validate
+
+      - name: Publish reusable build image tag
+        if: github.event_name != 'pull_request' && steps.reuse-buildenv.outputs.reused != 'true'
+        run: |
+          BUILDENV_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.buildenv-tag.outputs.tag }}"
+          docker tag mlc-llm:ci-test "$BUILDENV_IMAGE"
+          docker push "$BUILDENV_IMAGE"
+
+      - name: Tag validated image for GHCR
+        if: github.event_name != 'pull_request'
+        run: |
+          # Tag the validated local image with every GHCR tag
+          while IFS= read -r tag; do
+            docker tag mlc-llm:ci-test "$tag"
+          done <<< "${{ steps.meta.outputs.tags }}"
+
+      - name: Push validated image to GHCR
+        if: github.event_name != 'pull_request'
+        run: |
+          while IFS= read -r tag; do
+            docker push "$tag"
+          done <<< "${{ steps.meta.outputs.tags }}"
+
+      - name: Set image reference for downstream jobs
+        id: image-ref
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            BUILDENV_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.buildenv-tag.outputs.tag }}"
+            echo "image=${BUILDENV_IMAGE}" >> "$GITHUB_OUTPUT"
+          else
+            # PRs don't push; downstream will rebuild from GHA cache
+            echo "image=" >> "$GITHUB_OUTPUT"
+          fi
+
+
+  wheel-linux:
+    name: Wheel (Linux x64)
+    runs-on: ubuntu-latest
+    needs: docker
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Log in to GHCR
+        if: needs.docker.outputs.image != ''
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull validated Docker image
+        if: needs.docker.outputs.image != ''
+        run: |
+          docker pull "${{ needs.docker.outputs.image }}"
+          docker tag "${{ needs.docker.outputs.image }}" mlc-llm:build
+
+      - name: Set up Docker Buildx
+        if: needs.docker.outputs.image == ''
+        uses: docker/setup-buildx-action@v3
+
+      - name: Rebuild image from cache (PR only)
+        if: needs.docker.outputs.image == ''
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          load: true
+          tags: mlc-llm:build
+          cache-from: type=gha
+
+      - name: Restore Linux ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-linux-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', '**/*.cmake', 'docker/config.cmake') }}
+          restore-keys: ccache-linux-${{ runner.os }}-
+
+      - name: Build wheel
+        run: |
+          docker run --rm \
+            --user root \
+            -e CCACHE_DIR=/workspace/.ccache \
+            -e CCACHE_MAXSIZE=2G \
+            -v "$PWD":/workspace \
+            mlc-llm:build build
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-linux-x64
+          path: dist/*.whl
+          if-no-files-found: error
+
+      - name: Attest wheel provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: dist/*.whl
+
+
+  wheel-windows:
+    name: Wheel (Windows x64)
+    runs-on: windows-latest
+    needs: [lint, test]
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Setup build environment
+        uses: ./.github/actions/setup-build-env
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-windows-${{ hashFiles('CMakeLists.txt', '**/*.cmake') }}
+          restore-keys: ccache-windows-
+
+      - name: Build native libraries
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path build | Out-Null
+          @"
+          set(TVM_SOURCE_DIR "3rdparty/tvm")
+          set(CMAKE_BUILD_TYPE "Release")
+          set(USE_CUDA OFF)
+          set(USE_CUTLASS OFF)
+          set(USE_CUBLAS OFF)
+          set(USE_ROCm OFF)
+          set(USE_VULKAN OFF)
+          set(USE_METAL OFF)
+          set(USE_OPENCL OFF)
+          set(USE_OPENCL_ENABLE_HOST_PTR OFF)
+          "@ | Out-File -FilePath build\config.cmake -Encoding utf8
+          cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+          cmake --build . --config Release --parallel $env:NUMBER_OF_PROCESSORS
+          cd ..
+
+      - name: Package wheel
+        shell: pwsh
+        run: |
+          cd python
+          pip wheel . --no-deps --wheel-dir $PWD\..\dist
+          cd ..
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-windows-x64
+          path: dist/*.whl
+          if-no-files-found: error
+
+      - name: Attest wheel provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: dist/*.whl
+
+
+  smoke-linux:
+    name: Smoke (Linux)
+    runs-on: ubuntu-latest
+    needs: wheel-linux
+    steps:
+      - name: Download wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel-linux-x64
+          path: dist
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install and verify
+        run: |
+          pip install --no-deps dist/*.whl
+          pip show mlc_llm
+          python -c "from importlib.metadata import version; print('mlc_llm', version('mlc_llm'))"
+
+  smoke-windows:
+    name: Smoke (Windows)
+    runs-on: windows-latest
+    needs: wheel-windows
+    steps:
+      - name: Download wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel-windows-x64
+          path: dist
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install and verify
+        shell: pwsh
+        run: |
+          $wheel = (Get-ChildItem dist\*.whl).FullName
+          pip install --no-deps $wheel
+          pip show mlc_llm
+          python -c "from importlib.metadata import version; print('mlc_llm', version('mlc_llm'))"
+
+
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs: [smoke-linux, smoke-windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Download wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: wheels
+          merge-multiple: true
+
+      - name: Verify tag matches wheel version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          # Extract version from the first wheel filename (name-VERSION-…)
+          WHEEL_FILE="$(ls wheels/*.whl | head -1)"
+          WHEEL_VER="$(basename "$WHEEL_FILE" | sed 's/^[^-]*-\([^-]*\)-.*/\1/')"
+          echo "Git tag version : $TAG"
+          echo "Wheel version   : $WHEEL_VER"
+          if [ "$TAG" != "$WHEEL_VER" ]; then
+            echo "::error::Tag version ($TAG) does not match wheel version ($WHEEL_VER)"
+            exit 1
+          fi
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign wheels (keyless)
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          for wheel in wheels/*.whl; do
+            cosign sign-blob --yes \
+              --output-signature "${wheel}.sig" \
+              --output-certificate "${wheel}.crt" \
+              "$wheel"
+          done
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            wheels/*.whl
+            wheels/*.sig
+            wheels/*.crt
+          generate_release_notes: true
