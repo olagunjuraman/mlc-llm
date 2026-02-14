@@ -79,7 +79,7 @@ jobs:
       - name: Compute reusable image tag
         id: buildenv-tag
         run: |
-          echo "tag=buildenv-${{ hashFiles('docker/Dockerfile', 'docker/build-entrypoint.sh', 'docker/config.cmake') }}" >> "$GITHUB_OUTPUT"
+          echo "tag=buildenv-${{ hashFiles('docker/**') }}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

@@ -1,0 +1,26 @@
+name: mlc
+channels:
+  - conda-forge
+dependencies:
+  # ── Core build (per official docs) ─────────────────────
+  - python=3.13=*_cp313
+  - cpython
+  - cmake>=3.24
+  - rust=1.82.0
+  - ninja
+
+  # ── Python packaging ──────────────────────────────────
+  - pip
+  - wheel
+  - setuptools
+
+  # ── LLVM backend (required by config.cmake USE_LLVM) ───
+  - llvmdev>=15
+  - zlib
+  - zstd
+  - libxml2
+  - ncurses
+
+  # ── Test/validation only ───────────────────────────────
+  - pytest
+  - numpy

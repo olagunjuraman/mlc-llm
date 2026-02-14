@@ -1,0 +1,17 @@
+.git
+.github
+build/
+dist/
+*.whl
+.ccache
+__pycache__
+*.pyc
+*.pyo
+.env
+.venv
+*.egg-info
+node_modules
+docs/
+*.md
+LICENSE
+.gitignore
